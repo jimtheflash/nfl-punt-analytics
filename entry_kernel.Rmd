@@ -1,0 +1,640 @@
+---
+title: "NFL Punt Analytics"
+author: "Jim Kloet"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: TRUE
+    toc_float: TRUE
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Overview
+
+This kernel generates the data analysis and visualizations supporting my entry in the NFL Punt Analytics competition. In summary, I recommend making the following changes to the rules:  
+
+1. Add an item to NFL Rule 12 Section 2 Article 7-a which states:  
+_"Punt coverage players pursuing the punt returner, but who are not imminently going to tackle the punt returner, shall not be contacted above the shoulders by players on the punt return team, when the punt coverage player is traveling in a direction parallel to the goal lines or toward their own goal line, and the punt return player is traveling in a direction either perpendicular to the punt coverage player or toward the punt coverage player."_
+
+2. Add an item to NFL Rule 12 Section 2 Article 8 which states:  
+_"On punt plays, it is a foul if a player initiates contact with his helmet against an opponent."_  
+
+## Supplemental Video Analysis 
+
+Before carrying out any structured data analyses, I watched all of the sample videos provided in the `video_footage-injury` table. I made a couple observations:  
+
+1. 12 of 37 concussions happened >10 yards downfield from line of scrimmage, when a punt return player blocked a punt coverage player who was pursuing the punt returner, from the front or side, at a high speed.  
+
+2. 8 of 37 concussions happeneed when a punt coverage player initiated contact with the helmet while attempting to make a tackle.
+
+## Structured Data Analyses
+
+### Data Wrangling 
+
+I carred out a number of analyses on the structured data provided for the competition. Before I could do any analyses, however, I needed to wrangle the data.
+
+#### Prepare Environment and Data
+
+First, we need to load a few libraries.
+
+```{r echo=TRUE, message=FALSE}
+library(tidyverse)
+library(data.table)
+library(formattable)
+```
+
+Next, we can import the data. The data are provided as a set of csv files, which we'll loop through and add to the global environment.
+
+```{r echo=FALSE}
+setwd("/Users/jim/Documents/data/kaggle_nfl_punts")
+csv_files <- list.files(pattern = "csv$")
+for (i in csv_files) {
+  print(paste0("importing ", i, "..."))
+  element_name <- gsub(".csv", "", i, fixed = TRUE)
+  assign(element_name, data.table::fread(i), envir = .GlobalEnv)
+  rm(i, element_name)
+}
+```
+
+Since the NGS data are quite large, I filter out cases that aren't punt plays with documented concussions.
+
+```{r echo=FALSE}
+# i think playids can be recycled across seasons, but gamekey + playid is unique
+gamekey_playids <- paste0(`video_footage-injury`$gamekey, "_", `video_footage-injury`$playid)
+# loop through the objects in environment with next gen stats data, extract relevant plays
+ngs_files <- ls(pattern = "^NGS")
+ngs_data <- list()
+for (i in ngs_files) {
+  print(paste0("inspecting ", i, "..."))
+  temp <- get(i)
+  temp <- temp[, gamekey_playid := paste0(GameKey, "_", PlayID)]
+  temp <- temp[gamekey_playid %in% gamekey_playids]
+  if (nrow(temp) == 0) {
+    next
+  }
+  ngs_data[[i]] <- temp
+  rm(temp, i)
+}
+ngs_dt <- data.table::rbindlist(ngs_data)
+print(paste0("dimensions of ngs_dt: ", nrow(ngs_dt), " rows, ", ncol(ngs_dt), " cols..."))
+```
+
+#### Tidy and Enrich Data
+
+The data are for the most part nicely structured, and documented [here](https://www.kaggle.com/c/NFL-Punt-Analytics-Competition/data).  
+
+Fractional time wasn't parsing in a straightforward way for some reason. So I used a roundabout approach:
+
+``` {r}
+parseable_time <- data.table::tstrsplit(ngs_dt$Time, split = " ")
+date_part <- as.Date(parseable_time[[1]])
+num_date_part <- as.numeric(date_part)
+time_part <- parseable_time[[2]]
+split_time_part <- data.table::tstrsplit(time_part, split = ":")
+num_time_part <- 
+  (as.numeric(split_time_part[[1]]) * 360) + 
+  (as.numeric(split_time_part[[2]]) * 60) + 
+  as.numeric(split_time_part[[3]])
+num_datetime <- num_date_part + num_time_part
+ngs_dt$ordinal_time <- num_datetime
+```
+
+Speed isn't provided in the NGS data, so we need to calculate it using distance:
+
+```{r}
+ngs_dt <- ngs_dt[order(GSISID, GameKey, PlayID, ordinal_time),
+                 `:=`(frame_diff = ordinal_time - data.table::shift(ordinal_time),
+                      elapsed_time = ordinal_time - min(ordinal_time, na.rm = TRUE)),
+                 by = list(GSISID, GameKey, PlayID)]
+ngs_dt <- ngs_dt[order(GSISID, GameKey, PlayID, ordinal_time),
+  `:=`(yards_per_sec = dis / frame_diff,
+       miles_per_hour = ((dis / frame_diff) / 1760) * (60 * 60))]
+```
+
+We need to convert the orientation and direction fields in the NGS data to radians for plotting; they also seem to need to be rotated 180 degrees:
+
+```{r}
+ngs_dt <- ngs_dt[, `:=`(o_rad = o * (pi / 90),
+                        dir_rad = dir * (pi / 90))]
+```
+
+Joins are straightforward:
+
+``` {r}
+# add game_data
+ngs_dt <- game_data[ngs_dt, on = "GameKey"]
+# add player_punt_data
+position_lu <- player_punt_data[, list(pos = Position[1]), by = GSISID]
+ngs_dt <- position_lu[ngs_dt, on = "GSISID"]
+# add play_information
+play_information <- play_information[, gamekey_playid := paste0(GameKey, "_", PlayID)]
+ngs_dt <- play_information[ngs_dt, on = "gamekey_playid"]
+# add play_player_role_data; engineer roles that don't specify L/R
+play_player_role_data <- 
+  play_player_role_data[ ,
+                         `:=`(gamekey_playid = paste0(GameKey, "_", PlayID),
+                              gamekey_playid_gsisid = paste0(GameKey, "_", PlayID, "_", GSISID),
+                              fixed_role = 
+                                ifelse(grepl("G[LR]", Role), "G",
+                                ifelse(grepl("PD[LMR]", Role), "PD",
+                                ifelse(grepl("P[LR]G", Role), "PG",
+                                ifelse(grepl("PL[LMR]", Role), "PL",
+                                ifelse(grepl("P[LR]T", Role), "PT",
+                                ifelse(grepl("P[LR]W", Role), "PW",
+                                ifelse(grepl("PP[LR]", Role), "PP",
+                                ifelse(grepl("V[LR]", Role), "V",
+                                 Role)))))))))]
+ngs_dt <- ngs_dt[, gamekey_playid_gsisid := paste0(gamekey_playid, "_", GSISID)]
+ngs_dt <- play_player_role_data[ngs_dt, on = "gamekey_playid_gsisid"]
+# add concussion play info
+video_review <- video_review[, `:=`(gamekey_playid = paste0(GameKey, "_", PlayID),
+                                    concussed_GSISID = GSISID)]
+video_review <- video_review[, GSISID := NULL]
+ngs_dt <- video_review[ngs_dt, on = "gamekey_playid"]
+# tidy up columns
+cols_to_remove <- names(ngs_dt)[grepl("^i|[12]$", names(ngs_dt))]
+ngs_dt <- ngs_dt[, !cols_to_remove, with = FALSE]
+# make a table for the roles to identify which side of the ball they're on
+role_lu <- ifelse(
+  grepl("^G[LR]|P[LR]W|P[LR]T|P[LR]G|^PC|^PLS|PP[LR]|^P$", ngs_dt$Role), 
+  "punt", "rec")
+ngs_dt <- ngs_dt[, Side := role_lu]
+print(paste0("dimensions of ngs_dt: ", nrow(ngs_dt), " rows, ", ncol(ngs_dt), " cols..."))
+```
+
+At this point, the object `ngs_dt` contains NGS data for every player on the sample of punt plays included in the competition dataset, enriched with all of the play-level, game-level, and player-level data also included in the competition dataset.  
+
+Once the data were wrangled, I formulated a handful of questions to structure my investigation into the structured data (i.e. the tables provided as csv's). In most cases, my first question would be, "_should_ we make changes to rules to reduce concussions?" but in the case of player safety, I think we can reasonably assume the answer to that question is "yes!"  
+
+### Which Roles Are Involved in Concussions on Punt Plays?
+
+It is plausible that a segment or segments of players (e.g. certain positions, sizes of players, experience, etc.) are more likely to be concussed on punt plays, or are more likely to be the primary partner during a concussion. If that's the case, then it might make sense to focus any  rule changes to preferentially inmpact those players.  
+
+There is significant precedent in the NFL for rule changes to be made with the goal of protecting players in specific positions/roles/situations (e.g. QB, kick returns, defenseless players), making it at least plausible that a rule change like this could be tested or adopted.  
+
+#### Concussions by Role
+
+First we'll look at concussions by role, specifically the proportion of concussions in the sample attributed to each role, the expected proportion (based on number of players of that role on the field during punt plays), and the difference between expected and observed proportion of concussions, which can give us insight if some roles carry more risk than others.  
+
+``` {r echo=FALSE}
+injury_data <- video_review %>%
+  dplyr::inner_join(position_lu, by = c("concussed_GSISID" = "GSISID")) %>%
+  dplyr::inner_join(play_player_role_data, 
+                    by = c("Season_Year", 
+                           "GameKey", 
+                           "PlayID",
+                           "concussed_GSISID" = "GSISID",
+                           "gamekey_playid"))
+role_injury_table <- prop.table(table(injury_data$fixed_role))
+play_player_role_freq <- play_player_role_data %>%
+  dplyr::filter(gamekey_playid %in% gamekey_playids)
+role_prop_table <- prop.table(table(play_player_role_freq$fixed_role))
+role_deltas <- list()
+for (i in names(role_prop_table)) {
+  incidence <- try(role_injury_table[[i]], silent = TRUE)
+  expected <- try(role_prop_table[[i]], silent = TRUE)
+  if (class(incidence) == "try-error") {
+    role_deltas[[i]] <- data.frame(role = i,
+                                   observed = 0,
+                                   expected = expected,
+                                   diff = 0 - expected,
+                                   stringsAsFactors = FALSE)
+    next
+  }
+  role_deltas[[i]] <- data.frame(role = i,
+                                 observed = incidence,
+                                 expected = expected,
+                                 diff = incidence - expected,
+                                 stringsAsFactors = FALSE)
+}
+role_delta_df <- do.call(rbind, role_deltas) %>%
+  dplyr::arrange(-observed, -diff) %>%
+  dplyr::mutate_if(is.numeric, round, 3)
+role_delta_df %>%
+  formattable::formattable(list(`observed` = formattable::normalize_bar(),
+                                `expected` = formattable::normalize_bar(),
+                                `diff` = formattable::color_text("blue", "red")))
+```
+
+In the table above, `role` is the player role on punt plays; `observed` is the proportion of concussions in the sample (n = 37) accounted for by that role; `expected` is the proportion of concussions we would expect to be accounted for by that role given the proportion of players in that role on punt plays in the sample; and `diff` is the difference between the observed and expected proportions.
+
+Several observations:  
+ 
+* Over three quarters (75.7%) of concussions in the sample of punt plays happened to players on the punt coverage side of the ball.
+* The PG role acccounted for the largest proportion of concucussions (21.6%). PGs are interior linemen on punt coverage who initially serve as blockers (primarily of interior rushers) until the punt is in the air, but who then rush downfield in pursuit of the PR once the punt is in the air. This role also accounted for 12.5% more concussions in the sample than expected, greater than any other role.  
+* The PW role, punt converage players who serve a similar role as PG in that they initially serve as blockers (primarily of edge rushers) before pursuing the PR, accounted for the second greatest proportion of concussions in the sample (16.2%), which was 7.1% more concussions than expected.  
+* The G role, punt converage players who immediately rush downfield after the punt and are often the first defenders to meet the PR, accounted for 13.5% of concussions in the sample, approximately 4.4% more than expected.  
+* Only one role on the punt return side of the ball accounted for more than 10% of concussions in the sample, which was unsurprisingly the PR, the player who actually receives the punt. Players in the PR role accounted for 13.5% of concussions in the sample, which was 9.0% more than expected (given that there is only a single PR on most punt plays).  
+
+It may also be helpful to understand which skill positions fill the different roles on the punt units as well.
+
+``` {r echo=FALSE}
+position_table <- player_punt_data %>%
+  dplyr::inner_join(play_player_role_data) %>%
+  dplyr::group_by(GSISID) %>%
+  dplyr::summarise(pos = dplyr::first(Position),
+                   rol = dplyr::first(fixed_role)) %>%
+  dplyr::ungroup()
+unique_roles <- unique(position_table$rol)
+output_table <- list()
+for (i in unique_roles) {
+  selected_rol <- position_table[position_table$rol == i, ]
+  total <- nrow(selected_rol)
+  WR_count <- sum(selected_rol$pos == "WR")
+  TE_count <- sum(selected_rol$pos == "TE")
+  output_table[[i]] <- data.frame(Role = i,
+                                  Obs = total,
+                                  WR = round(WR_count / total, 3),
+                                  TE = round(TE_count / total, 3),
+                                  stringsAsFactors = FALSE)
+  row.names(output_table[[i]]) <- NULL
+}
+output_df <- do.call(rbind, output_table) %>%
+  dplyr::arrange(-Obs) %>%
+  formattable::formattable(list(`Obs` = formattable::normalize_bar(),
+                                `WR` = formattable::color_text("blue", "red"),
+                                `TE` = formattable::color_text("blue", "red")))
+output_df
+```
+
+Looks like there are a lot of TEs in the PW, PG, and PT roles, and a lot of WRs serving as PR (not a surprise).
+
+#### Concussion Primary Partners by Role
+
+Next, we'll run the same analysis on primary partners, to explore if certain roles are more frequently involved in plays with concussions (but do not themselves experience a concussion) than others. I don't expect there to be rule changes made to restrict players in certain roles in an effort to reduce concussions, as that might expose those restricted players to injury, but understanding who is involved with injuries can provide important context to be considered when making recommendations intended to protect other players. Note: on 4 plays, no primary partner was indicated, due to either the ground causing the concussion, or a lack of clarity around which player actually served as a primary partner.
+
+``` {r echo=FALSE, warning=FALSE}
+injury_data_pp <- injury_data %>%
+  dplyr::mutate(Primary_Partner_GSISID = as.integer(Primary_Partner_GSISID)) %>%
+  dplyr::inner_join(position_lu, 
+                    by = c("Primary_Partner_GSISID" = "GSISID"),
+                    suffix = c("", "_pp")) %>%
+  dplyr::inner_join(play_player_role_data,
+                    by = c("Season_Year", 
+                           "GameKey", 
+                           "PlayID", 
+                           "Primary_Partner_GSISID" = "GSISID"),
+                    suffix = c("", "_ppr"))
+pp_roles_table <- prop.table(table(injury_data_pp$fixed_role_ppr))
+pp_role_deltas <- list()
+for (i in names(role_prop_table)) {
+  incidence <- try(pp_roles_table[[i]], silent = TRUE)
+  expected <- try(role_prop_table[[i]], silent = TRUE)
+  if (class(incidence) == "try-error") {
+    pp_role_deltas[[i]] <- data.frame(role = i,
+                                     observed = 0,
+                                     expected = expected,
+                                     diff = 0 - expected,
+                                     stringsAsFactors = FALSE)
+    next
+  }
+  pp_role_deltas[[i]] <- data.frame(role = i,
+                                   observed = incidence,
+                                   expected = expected,
+                                   diff = incidence - expected,
+                                   stringsAsFactors = FALSE)
+}
+pp_role_delta_df <- do.call(rbind, pp_role_deltas) %>%
+  dplyr::arrange(-observed, -diff) %>%
+  dplyr::mutate_if(is.numeric, round, 3)
+pp_role_delta_df
+```
+
+The table above can be interpreted the same as the previous section. Several observations:  
+ 
+* The PR was the primary partner in 24.2% of concussions in the sample. This was 19.7% more than expected based on prevalence of the role alone, but considering that most players during a punt are moving toward the PR (either to block for him or to tackle him) this may not be surprising.
+* PDs, who account for the largest proportion of any specific role during punts, were also primary partners in 24.2% of concussions in the sample, but this was slightly less than expected given their prevalence on the field.
+* Outside of PR, the only role who were primary partners at least 10% more or less than expected were Vs, who were expected to be primary partners on 13.5% but were considered primary partners on only 3%. No other role had greater than 4.6% difference between expected and observed.
+
+#### Role Interactions During Concussions
+
+Finally, I explored pairwise role interactions during concussions plays, to investigate if there are certain combinations of roles more frequently involved in concussions.  
+
+``` {r echo=FALSE}
+injury_data_pp %>%
+  dplyr::mutate(combos = paste0(fixed_role, '_', fixed_role_ppr)) %>%
+  dplyr::group_by(combos) %>%
+  dplyr::mutate(freq = n()) %>%
+  dplyr::filter(dplyr::row_number() == 1) %>%
+  dplyr::ungroup() %>%
+  dplyr::transmute(concussed_role = fixed_role,
+                   primary_partner_role = fixed_role_ppr,
+                   freq = freq) %>%
+  dplyr::arrange(-freq)
+```
+
+Only six of 26 combinations occurred more than 5% of the time: PW concussed with PD as primary partner occurred three times (~9.1% of the time); and G concussed with PR as primary partner, PT concussed with PT as primary partner, PG concussed with PW as primary partner, PG concussed with PR as primary partner, and PG concussed with PD as primary partner each occurred two times (~6.1%).  
+
+These analyses align with the previous analyses, that players on the line of the punt coverage side (PGs, PWs, PTs) and PRs are the roles most frequently involved in concussions.
+
+#### Summary  
+
+The findings from this analysis suggest that there are asymmetries across the roles on punt plays in both the frequency and risk of concussions. The starkest contrast is that players on the punt coverage side of the ball accounted for more than 75% of the concussions in this sample, over 25% more than we'd expect by opportunity alone.  
+
+On the punt coverage side of the ball, the most frequently concussed roles are players who initially start the play as blockers (PG, PT, PW), but who then must disengage from their blocks and race downfield to stop the PR from gaining any additional yardage. Punt coverage players weren't primary partners in concussion plays more than one would expect from their prevalence on punt plays.
+
+On the punt return side of the ball, the most frequently concussed role is the PR, unsurprisingly. It is worth noting that most of the punt return roles experienced far fewer concussions than expected; PR was the exception to that trend. PRs accounted for the highest proportion of primary concussion partners in the sample.
+
+These analyses suggest that players on the line of scrimmage for the punt coverage side are at greater risk of being concussed than being primary partners. In addition, these analyses suggest that PRs are likely to be involved in concussions on punts as both primary partners and recipient of the concussion.
+
+Answering this question did not immediately yield any concrete recommendations for changes to the rules: it isn't clear from these data _why_ certain roles have higher incidence or risk of concussions than others. However, an understanding of the roles who have the highest risk for concussion during punt plays will inform subsequent data analyses and focuses the scope of video and animation analyses.  
+
+### How Are Concussions Happening?
+
+There is an extensive literature on concussion etiology; see [Clark et al. 2017](https://www.ncbi.nlm.nih.gov/pubmed/28056179) and [Lessley et al. 2018](https://www.ncbi.nlm.nih.gov/pubmed/30398897)for recent investigations using NGS data. The NGS data in the present sample includes a number of labeled dimensions related to concussion etiology.
+
+#### Player Activities
+
+The `video_review` data are coded for the behaviors the concussed players and primary partners were engaged in when the concussion event occurred. 
+
+``` {r echo=FALSE}
+plot_data <- factor(video_review$Player_Activity_Derived, 
+                    levels = c("Tackling", "Blocked", "Blocking", "Tackled"))
+ggplot2::qplot(plot_data) +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab("Count") +
+  ggplot2::ggtitle("Distribution of Concussed Player Activities During Concussion Events") +
+  ggplot2::theme_minimal()
+```
+
+Most concussed players were either in the act of tackling (13) or being blocked (10), followed by blocking (8), and being tackled (6). This aligns with the previous finding that most concussions were experienced by players on the punt coverage team.  
+
+This four-level coding scheme may have opportunities for additional levels or reformulations. This will be addressed in the Video Analyses.  
+
+#### Impact Types
+
+In addition the activities, the `video_review` data also include type of impact associated with the concussion.  
+
+``` {r echo=FALSE}
+plot_data <- factor(video_review$Primary_Impact_Type, 
+                    levels = c("Helmet-to-body", "Helmet-to-helmet", "Helmet-to-ground", "Unclear"))
+ggplot2::qplot(plot_data) +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab("Count") +
+  ggplot2::ggtitle("Distribution of Impact Types During Concussion Events") +
+  ggplot2::theme_minimal()
+```
+
+There were an equal number of players concussed by helmet-to-body and helmet-to-helmet impacts (17).
+
+#### Summary
+
+Most of the concussions in this sample happened as a result of a player attempting to make a tackle or a player being blocked; conversely, relatively few concussions in this sample happened as a result of a player being tackled or making a block.  
+
+This aligns with the findings in the previous section, that most concussions happen to players on the punt coverage side of the ball. These players engage in tackling, and are also blocked.  
+
+There didn't appear to be a bias toward concussions resulting from helmet-to-helmet vs. helmet-to-body impacts. Given recent rule changes geared toward limiting helmet-to-helmet hits, this is a little surprising, but the scope of those rules may not include the specific impacts that are occurring here. This will be addressed in the Video Analyses.
+
+### What Are Players Doing Before Concussion Impacts?
+
+On the basis of my video review, there are two kinds of plays I'd like to focus on in more detail: downfield blocks on unsuspecing players, and open tackles of PRs by players who start in the tackle box on the punt coverage side. I think graphical methods are especially useful for understanding what happens on a downfield block of an unsuspecting player. 
+
+#### Downfield block of unsuspecting players
+
+In this first example, I've plotted approximately 1 second prior to a concussion event, where a player on the punt coverage team (the LS) is concussed after being hit by a blindside block from a punt return player (a PD) downfield.  
+
+In the graphs below, the light grey dots are on the punt coverage team, the dark grey dots are on the punt return team, the red dot is the player who gets concussed, and the yellow dot is the primary partner. Per the [supplied video](http://a.video.nfl.com//films/vodzilla/153258/61_yard_Punt_by_Brett_Kern-g8sqyGTz-20181119_162413664_5000k.mp4) of the play, at this point in the play the PR is moving toward the bottom of the screen (parallel to goal lines) and is being pursued by several members of the coverage team.
+
+``` {r echo=FALSE}
+# plotting data
+selected_play <- ngs_dt[gamekey_playid == "392_1088"]
+
+# get info about the game for title
+matchup <- selected_play$Home_Team_Visit_Team[[1]]
+gamedate <- selected_play$Game_Date[[1]]
+punting_team <- selected_play$Poss_Team[[1]]
+receiving_team <- ifelse(selected_play$HomeTeamCode[[1]] == punting_team,
+                         selected_play$VisitTeamCode[[1]],
+                         selected_play$HomeTeamCode[[1]])
+
+# get time bounds for filtering
+lower_time_bound <- 0 # min(selected_play[Event %in% play_start_events, ordinal_time])
+upper_time_bound <- Inf # max(c(lower_time_bound + 20, max(selected_play[Event %in% play_end_events, ordinal_time])))
+filtered_play <- selected_play[ordinal_time >= lower_time_bound & ordinal_time <= upper_time_bound]
+if (nrow(filtered_play) == 0) {
+  next
+}
+
+# make a the input for the plot
+plot_input <- selected_play %>%
+  tibble::as.tibble() %>%
+  dplyr::left_join(video_review, by = "gamekey_playid", suffix = c("", "_cd")) %>%
+  dplyr::mutate(color_id = dplyr::if_else(GSISID == concussed_GSISID, "concussed_player",
+                                          dplyr::if_else(GSISID == Primary_Partner_GSISID, "concussion_partner",
+                                                         Side))) %>%
+  dplyr::mutate(color_id = dplyr::if_else(is.na(color_id), Side, color_id)) %>%
+  dplyr::mutate(display_time = ordinal_time - min(ordinal_time)) %>%
+  dplyr::mutate(display_time = round(display_time, 1)) %>%
+  dplyr::select_if(~sum(!is.na(.)) > 0) %>%
+  na.omit() %>%
+  dplyr::filter(display_time == 34.5)
+
+new_title <- paste0("GameKey ", selected_play$GameKey[[1]], 
+                    ", PlayID ", selected_play$PlayID[[1]],
+                    ", ", round(plot_input$elapsed_time, 1), " sec elapsed")
+
+p <- ggplot2::ggplot(plot_input, ggplot2::aes(x = x,
+                                              y = y, 
+                                              color = color_id,
+                                              ids = GSISID,
+                                              label = fixed_role,
+                                              frame = display_time)) +
+  ggplot2::coord_cartesian(xlim = c(0, 120), ylim = c(0, 53)) +
+  ggplot2::geom_spoke(ggplot2::aes(angle = dir_rad, radius = 3), arrow = ggplot2::arrow(length = ggplot2::unit(.1, "inches"))) +
+  ggplot2::geom_point(size = 3, alpha = .6) +
+  ggplot2::geom_text(ggplot2::aes(label = fixed_role), size = 1.667, color = 'black') +
+  ggplot2::geom_text(ggplot2::aes(x = 10, y = 50, label = Event), color = 'darkgrey') +
+  ggplot2::theme_minimal() +
+  ggplot2::scale_color_manual(values = c("concussed_player" = "firebrick1",
+                                         "concussion_partner" = "goldenrod2", 
+                                         "rec" = "grey50", 
+                                         "punt" = "grey80")) +
+  ggplot2::theme(legend.position = "none",
+                 panel.grid.minor.y = ggplot2::element_blank()) +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab(NULL) +
+  ggplot2::scale_x_continuous(breaks = seq(0, 120, 10), 
+                              labels = c('', 'G', '10', '20', '30', '40', '50', '40', '30', '20', '10', 'G', '')) +
+  ggplot2::scale_y_continuous(breaks = c(0, 53.3), 
+                              labels = c('', '')) +
+  ggplot2::ggtitle(new_title)
+p
+
+current_speed <- plot_input %>%
+  dplyr::select(GSISID, fixed_role, miles_per_hour) %>%
+  dplyr::arrange(-miles_per_hour) %>%
+  dplyr::mutate_if(is.numeric, round, 1)
+names(current_speed) <- c("Player", "Role", "Speed (mph)")
+current_speed
+```
+
+At this point in the play, the LS (concussed player) and PD (primary partner) are approximately 10 yards away; the LS is moving at 16 mph in pursuit of the PR, is not anticipating a block, and is not imminently going to make a tackle; the PD is moving at 16.8 mph toward the LS.  
+
+Here's 0.5 seconds later:
+
+``` {r echo=FALSE}
+# plotting data
+selected_play <- ngs_dt[gamekey_playid == "392_1088"]
+
+# get info about the game for title
+matchup <- selected_play$Home_Team_Visit_Team[[1]]
+gamedate <- selected_play$Game_Date[[1]]
+punting_team <- selected_play$Poss_Team[[1]]
+receiving_team <- ifelse(selected_play$HomeTeamCode[[1]] == punting_team,
+                         selected_play$VisitTeamCode[[1]],
+                         selected_play$HomeTeamCode[[1]])
+
+# get time bounds for filtering
+lower_time_bound <- 0 # min(selected_play[Event %in% play_start_events, ordinal_time])
+upper_time_bound <- Inf # max(c(lower_time_bound + 20, max(selected_play[Event %in% play_end_events, ordinal_time])))
+filtered_play <- selected_play[ordinal_time >= lower_time_bound & ordinal_time <= upper_time_bound]
+if (nrow(filtered_play) == 0) {
+  next
+}
+
+# make a the input for the plot
+plot_input <- selected_play %>%
+  tibble::as.tibble() %>%
+  dplyr::left_join(video_review, by = "gamekey_playid", suffix = c("", "_cd")) %>%
+  dplyr::mutate(color_id = dplyr::if_else(GSISID == concussed_GSISID, "concussed_player",
+                                          dplyr::if_else(GSISID == Primary_Partner_GSISID, "concussion_partner",
+                                                         Side))) %>%
+  dplyr::mutate(color_id = dplyr::if_else(is.na(color_id), Side, color_id)) %>%
+  dplyr::mutate(display_time = ordinal_time - min(ordinal_time)) %>%
+  dplyr::mutate(display_time = round(display_time, 1)) %>%
+  dplyr::select_if(~sum(!is.na(.)) > 0) %>%
+  na.omit() %>%
+  dplyr::filter(display_time == 35)
+
+new_title <- paste0("GameKey ", selected_play$GameKey[[1]], 
+                    ", PlayID ", selected_play$PlayID[[1]],
+                    ", ", round(plot_input$elapsed_time, 1), " sec elapsed")
+
+p <- ggplot2::ggplot(plot_input, ggplot2::aes(x = x,
+                                              y = y, 
+                                              color = color_id,
+                                              ids = GSISID,
+                                              label = fixed_role,
+                                              frame = display_time)) +
+  ggplot2::coord_cartesian(xlim = c(0, 120), ylim = c(0, 53)) +
+  ggplot2::geom_spoke(ggplot2::aes(angle = dir_rad, radius = 3), arrow = ggplot2::arrow(length = ggplot2::unit(.1, "inches"))) +
+  ggplot2::geom_point(size = 3, alpha = .6) +
+  ggplot2::geom_text(ggplot2::aes(label = fixed_role), size = 1.667, color = 'black') +
+  ggplot2::geom_text(ggplot2::aes(x = 10, y = 50, label = Event), color = 'darkgrey') +
+  ggplot2::theme_minimal() +
+  ggplot2::scale_color_manual(values = c("concussed_player" = "firebrick1",
+                                         "concussion_partner" = "goldenrod2", 
+                                         "rec" = "grey50", 
+                                         "punt" = "grey80")) +
+  ggplot2::theme(legend.position = "none",
+                 panel.grid.minor.y = ggplot2::element_blank()) +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab(NULL) +
+  ggplot2::scale_x_continuous(breaks = seq(0, 120, 10), 
+                              labels = c('', 'G', '10', '20', '30', '40', '50', '40', '30', '20', '10', 'G', '')) +
+  ggplot2::scale_y_continuous(breaks = c(0, 53.3), 
+                              labels = c('', '')) +
+  ggplot2::ggtitle(new_title)
+p
+
+current_speed <- plot_input %>%
+  dplyr::select(GSISID, fixed_role, miles_per_hour) %>%
+  dplyr::arrange(-miles_per_hour) %>%
+  dplyr::mutate_if(is.numeric, round, 1)
+names(current_speed) <- c("Player", "Role", "Speed (mph)")
+current_speed
+```
+
+Within a half second, the LS and PD have converged to less than two yards of each other. On camera, the LS recognizes an impact is imminent and slows down to brace for the hit.
+
+Here's 0.5 seconds later:
+
+``` {r echo=FALSE}
+# plotting data
+selected_play <- ngs_dt[gamekey_playid == "392_1088"]
+
+# get info about the game for title
+matchup <- selected_play$Home_Team_Visit_Team[[1]]
+gamedate <- selected_play$Game_Date[[1]]
+punting_team <- selected_play$Poss_Team[[1]]
+receiving_team <- ifelse(selected_play$HomeTeamCode[[1]] == punting_team,
+                         selected_play$VisitTeamCode[[1]],
+                         selected_play$HomeTeamCode[[1]])
+
+# get time bounds for filtering
+lower_time_bound <- 0 # min(selected_play[Event %in% play_start_events, ordinal_time])
+upper_time_bound <- Inf # max(c(lower_time_bound + 20, max(selected_play[Event %in% play_end_events, ordinal_time])))
+filtered_play <- selected_play[ordinal_time >= lower_time_bound & ordinal_time <= upper_time_bound]
+if (nrow(filtered_play) == 0) {
+  next
+}
+
+# make a the input for the plot
+plot_input <- selected_play %>%
+  tibble::as.tibble() %>%
+  dplyr::left_join(video_review, by = "gamekey_playid", suffix = c("", "_cd")) %>%
+  dplyr::mutate(color_id = dplyr::if_else(GSISID == concussed_GSISID, "concussed_player",
+                                          dplyr::if_else(GSISID == Primary_Partner_GSISID, "concussion_partner",
+                                                         Side))) %>%
+  dplyr::mutate(color_id = dplyr::if_else(is.na(color_id), Side, color_id)) %>%
+  dplyr::mutate(display_time = ordinal_time - min(ordinal_time)) %>%
+  dplyr::mutate(display_time = round(display_time, 1)) %>%
+  dplyr::select_if(~sum(!is.na(.)) > 0) %>%
+  na.omit() %>%
+  dplyr::filter(display_time == 35.5)
+
+new_title <- paste0("GameKey ", selected_play$GameKey[[1]], 
+                    ", PlayID ", selected_play$PlayID[[1]],
+                    ", ", round(plot_input$elapsed_time, 1), " sec elapsed")
+
+p <- ggplot2::ggplot(plot_input, ggplot2::aes(x = x,
+                                              y = y, 
+                                              color = color_id,
+                                              ids = GSISID,
+                                              label = fixed_role,
+                                              frame = display_time)) +
+  ggplot2::coord_cartesian(xlim = c(0, 120), ylim = c(0, 53)) +
+  ggplot2::geom_spoke(ggplot2::aes(angle = dir_rad, radius = 3), arrow = ggplot2::arrow(length = ggplot2::unit(.1, "inches"))) +
+  ggplot2::geom_point(size = 3, alpha = .6) +
+  ggplot2::geom_text(ggplot2::aes(label = fixed_role), size = 1.667, color = 'black') +
+  ggplot2::geom_text(ggplot2::aes(x = 10, y = 50, label = Event), color = 'darkgrey') +
+  ggplot2::theme_minimal() +
+  ggplot2::scale_color_manual(values = c("concussed_player" = "firebrick1",
+                                         "concussion_partner" = "goldenrod2", 
+                                         "rec" = "grey50", 
+                                         "punt" = "grey80")) +
+  ggplot2::theme(legend.position = "none",
+                 panel.grid.minor.y = ggplot2::element_blank()) +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab(NULL) +
+  ggplot2::scale_x_continuous(breaks = seq(0, 120, 10), 
+                              labels = c('', 'G', '10', '20', '30', '40', '50', '40', '30', '20', '10', 'G', '')) +
+  ggplot2::scale_y_continuous(breaks = c(0, 53.3), 
+                              labels = c('', '')) +
+  ggplot2::ggtitle(new_title)
+p
+
+current_speed <- plot_input %>%
+  dplyr::select(GSISID, fixed_role, miles_per_hour) %>%
+  dplyr::arrange(-miles_per_hour) %>%
+  dplyr::mutate_if(is.numeric, round, 1)
+names(current_speed) <- c("Player", "Role", "Speed (mph)")
+current_speed
+```
+
+The impact point. The arrows on the graph make it clear that the PD impacts the front and side of the LS. The players involved are now the two slowest moving players on the field.  
+
+The punt return team scored a touchdown on this play, and the PD was likely given praise for making the block that caused the concussion. However, the LS was never imminently going to make the tackle. The PD could've avoided causing a concussion, but still made a block, by targeting his block to the LS's torso.
+
+#### Summary
+
+The graphical analysis of NGS data allows us to get a clearer idea of the context around a concussion event. Here, we were able to visualize the player's position, direction, and speed in the moments leading to a concussion on a downfield block.
+
+## General Summary
+
+Video analyses suggest that there are areas of opportunity around downfield blocking of unsuspecting coverage players, and initiating contact with the helmet while attempting to make a tackle.
+
+Structured data analysis found that players on punt coverage who start in the tackle box (e.g. roles PG, PT, PW, LS) seem to be involved in more concussions than we'd expect by prevalence. These roles are generally filled by offensive skill position players like TE.  
+
+In addition, graphical analyses using the NGS data enabled us to get a clearer picture of the context surrounding concussion events on punts, specifically in cases where a punt coverage player is blocked downfield.
